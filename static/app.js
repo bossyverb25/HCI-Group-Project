@@ -1,10 +1,9 @@
 /**
  * The Invisible Interpreter — Prototype v1 Frontend Client
  * --------------------------------------------------------
- * - Streams 16kHz mono PCM audio over WebSocket to Faster-Whisper (`backend/transcription.py`)
- *   AND runs browser Web Speech API in parallel for ultra-low-latency interim text & fallback.
+ * - Streams 16kHz mono PCM audio over WebSocket exclusively to Faster-Whisper (`backend/transcription.py`).
  * - Maintains the latest pre-generated `words` and `phrases` suggestion bundle pushed from
- *   the backend's 30-second rolling cache (`backend/judgment.py`).
+ *   the backend's 30-second rolling Ollama cache (`backend/judgment.py`).
  * - Immediately reveals the 2 big suggestions (0ms perceived latency) when the user clicks
  *   "I'm Stuck — Words" or "I'm Stuck — Phrases", while logging all events to the backend.
  */
@@ -43,25 +42,23 @@
   let audioCtx = null;
   let mediaStream = null;
   let workletNode = null;
-  let speechRecognition = null;
   let activeMode = null; // "words" | "phrases" | null
   let latestTranscript = "";
 
   // Rolling pre-generated cache pushed continuously from the server
   let warmCache = {
     words: [
-      { text: "a headache", confidence: "high", score: 0.93 },
-      { text: "allergies", confidence: "medium", score: 0.78 },
+      { text: "...", confidence: "high", score: 0.9 },
+      { text: "...", confidence: "medium", score: 0.75 },
     ],
     phrases: [
-      { text: "a bad headache since yesterday", confidence: "high", score: 0.91 },
-      { text: "something for a sore throat", confidence: "medium", score: 0.76 },
+      { text: "...", confidence: "high", score: 0.9 },
+      { text: "...", confidence: "medium", score: 0.75 },
     ],
-    provider: "local-cache",
+    provider: "ollama",
     latency_ms: 0.0,
   };
 
-  // Connect WebSocket
   function connectWebSocket() {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
@@ -90,11 +87,9 @@
     if (msg.type === "session_init") {
       if (msg.cache) {
         warmCache = msg.cache;
-        llmEngineBadge.textContent = `Engine: ${msg.cache.provider}`;
+        llmEngineBadge.textContent = `LLM: ${msg.cache.provider}`;
       }
-      sttEngineBadge.textContent = msg.whisper_available
-        ? "STT: Faster-Whisper (Active)"
-        : "STT: Web Speech / Hybrid";
+      sttEngineBadge.textContent = `STT: faster-whisper (${msg.whisper_model || "base.en"})`;
     } else if (msg.type === "transcript_update") {
       if (msg.last_snippet) {
         latestTranscript = msg.full_text || msg.last_snippet;
@@ -107,9 +102,8 @@
     } else if (msg.type === "cache_update") {
       if (msg.cache) {
         warmCache = msg.cache;
-        llmEngineBadge.textContent = `Engine: ${msg.cache.provider}`;
+        llmEngineBadge.textContent = `LLM: ${msg.cache.provider}`;
         cacheStateEl.textContent = `Warm (${msg.rolling_cache_size || 1} cached)`;
-        // If suggestions are already open on screen, keep them fresh
         if (activeMode) {
           renderSuggestionsFromCache(activeMode, 0.0);
         }
@@ -162,11 +156,10 @@
         : "PHRASE COMPLETION SUGGESTIONS";
 
     if (provider) {
-      llmEngineBadge.textContent = `Engine: ${provider}`;
+      llmEngineBadge.textContent = `LLM: ${provider}`;
     }
     latencyBadge.textContent = `${retrievalMs.toFixed(1)} ms (from rolling cache)`;
 
-    // Card 0
     text0.textContent = items[0].text;
     const pct0 = Math.round((items[0].score || 0.9) * 100);
     conf0.textContent =
@@ -174,7 +167,6 @@
         ? `High Confidence (${pct0}%)`
         : `Alternative (${pct0}%)`;
 
-    // Card 1
     text1.textContent = items[1].text;
     const pct1 = Math.round((items[1].score || 0.75) * 100);
     conf1.textContent =
@@ -209,7 +201,7 @@
     hideSuggestions();
   }
 
-  // Audio Capture: 16kHz PCM AudioWorklet -> Faster-Whisper + Browser Web Speech API
+  // Audio Capture: 16kHz PCM AudioWorklet -> Faster-Whisper
   async function startListening() {
     try {
       mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -234,66 +226,19 @@
       };
 
       source.connect(workletNode);
-    } catch (err) {
-      console.warn("Microphone AudioWorklet warning:", err);
-    }
-
-    // Start Web Speech API in parallel if supported by browser for instant interim word updates
-    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (SpeechRec) {
-      try {
-        speechRecognition = new SpeechRec();
-        speechRecognition.lang = "en-US";
-        speechRecognition.continuous = true;
-        speechRecognition.interimResults = true;
-
-        speechRecognition.onresult = (event) => {
-          let transcript = "";
-          for (let i = Math.max(0, event.results.length - 3); i < event.results.length; i++) {
-            transcript += event.results[i][0].transcript + " ";
-          }
-          const cleaned = transcript.trim();
-          if (cleaned && ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(
-              JSON.stringify({
-                type: "browser_transcript",
-                text: cleaned,
-                engine: "faster-whisper + web-speech",
-              })
-            );
-          }
-        };
-
-        speechRecognition.onend = () => {
-          if (isListening && speechRecognition) {
-            try {
-              speechRecognition.start();
-            } catch (_) {}
-          }
-        };
-
-        speechRecognition.start();
-      } catch (err) {
-        console.debug("Web Speech API skipped:", err);
+      isListening = true;
+      updateListeningUI();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "listening_toggled", listening: true }));
       }
-    }
-
-    isListening = true;
-    updateListeningUI();
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "listening_toggled", listening: true }));
+    } catch (err) {
+      console.error("Failed to access microphone:", err);
+      alert("Could not access microphone. Please allow microphone permissions in your browser.");
     }
   }
 
   function stopListening() {
     isListening = false;
-    if (speechRecognition) {
-      try {
-        speechRecognition.onend = null;
-        speechRecognition.stop();
-      } catch (_) {}
-      speechRecognition = null;
-    }
     if (workletNode) {
       workletNode.disconnect();
       workletNode = null;
@@ -332,7 +277,6 @@
     }
   }
 
-  // Event Listeners
   btnToggleListen.addEventListener("click", () => {
     if (isListening) {
       stopListening();
@@ -348,23 +292,6 @@
   card0.addEventListener("click", () => selectSuggestion(0));
   card1.addEventListener("click", () => selectSuggestion(1));
 
-  // Role-play quick prompt buttons
-  document.querySelectorAll(".chip-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const promptText = btn.getAttribute("data-prompt") || "";
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({
-            type: "browser_transcript",
-            text: promptText,
-            engine: "roleplay-simulator",
-          })
-        );
-      }
-    });
-  });
-
-  // Keyboard Shortcuts for rapid testing / Wizard-of-Oz / Hands-free triggers
   window.addEventListener("keydown", (e) => {
     if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
     if (e.key === "1" || e.key === "ArrowLeft") {

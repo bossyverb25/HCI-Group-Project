@@ -2,11 +2,8 @@
 System 1: Listening & Transcription System
 ------------------------------------------
 Maintains a rolling 30-second 16kHz mono PCM audio buffer per client session
-and uses Faster-Whisper (`base.en` by default) with lightweight energy-based
+and uses Faster-Whisper (`base.en` by default) with energy-based
 Voice Activity Detection (VAD) to transcribe speech continuously.
-
-Also supports merging browser-streamed interim/final text (Web Speech API
-hybrid or fallback mode) so the system runs reliably on any hardware.
 """
 
 from __future__ import annotations
@@ -20,22 +17,13 @@ from dataclasses import dataclass, field
 from typing import Callable, Awaitable, Optional
 
 import numpy as np
+from faster_whisper import WhisperModel
 
 logger = logging.getLogger("interpreter.transcription")
 
-# Try importing faster-whisper; degrade gracefully if unavailable on Python 3.14 without ctranslate2 wheel
-try:
-    from faster_whisper import WhisperModel  # type: ignore
-    FASTER_WHISPER_AVAILABLE = True
-except Exception as exc:
-    WhisperModel = None
-    FASTER_WHISPER_AVAILABLE = False
-    logger.warning("faster-whisper could not be imported (%s). Hybrid/WebSpeech STT will remain active.", exc)
-
-
 SAMPLE_RATE = 16000
 MAX_BUFFER_SECONDS = 30
-TRANSCRIBE_WINDOW_SECONDS = 12  # Transcribe the latest 12s window for speed & context
+TRANSCRIBE_WINDOW_SECONDS = 30  # Transcribe the full 30-second rolling buffer for full context
 MIN_AUDIO_SECONDS = 0.6         # Minimum audio before attempting transcription
 SILENCE_RMS_THRESHOLD = 0.008   # RMS energy threshold to skip transcribing pure silence
 
@@ -50,8 +38,8 @@ class TranscriptState:
     updated_at: float = field(default_factory=time.time)
 
     @staticmethod
-    def extract_snippet(text: str, max_words: int = 8) -> str:
-        """Return only the last few words so the UI stays calm and glanceable."""
+    def extract_snippet(text: str, max_words: int = 24) -> str:
+        """Return up to the last 24 words so the user sees a larger context window."""
         words = text.strip().split()
         if not words:
             return ""
@@ -67,57 +55,43 @@ class FasterWhisperEngine:
         self.model_size = os.getenv("WHISPER_MODEL_SIZE", "base.en")
         self.device = os.getenv("WHISPER_DEVICE", "auto")
         self.compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-        self._model: Optional[ object ] = None
+        self._model: Optional[WhisperModel] = None
         self._lock = asyncio.Lock()
-        self.load_error: Optional[str] = None
 
-    @property
-    def is_available(self) -> bool:
-        return FASTER_WHISPER_AVAILABLE and self.load_error is None
-
-    async def ensure_loaded(self) -> bool:
-        if not FASTER_WHISPER_AVAILABLE:
-            return False
+    async def ensure_loaded(self) -> WhisperModel:
         if self._model is not None:
-            return True
+            return self._model
         async with self._lock:
             if self._model is not None:
-                return True
-            try:
-                logger.info(
-                    "Loading Faster-Whisper model '%s' (device=%s, compute_type=%s)...",
+                return self._model
+            logger.info(
+                "Loading Faster-Whisper model '%s' (device=%s, compute_type=%s)...",
+                self.model_size,
+                self.device,
+                self.compute_type,
+            )
+            loop = asyncio.get_running_loop()
+            self._model = await loop.run_in_executor(
+                None,
+                lambda: WhisperModel(
                     self.model_size,
-                    self.device,
-                    self.compute_type,
-                )
-                loop = asyncio.get_running_loop()
-                self._model = await loop.run_in_executor(
-                    None,
-                    lambda: WhisperModel(
-                        self.model_size,
-                        device=self.device,
-                        compute_type=self.compute_type,
-                    ),
-                )
-                logger.info("Faster-Whisper model '%s' loaded successfully.", self.model_size)
-                return True
-            except Exception as exc:
-                self.load_error = str(exc)
-                logger.error("Failed to load Faster-Whisper model: %s", exc)
-                return False
+                    device=self.device,
+                    compute_type=self.compute_type,
+                ),
+            )
+            logger.info("Faster-Whisper model '%s' loaded successfully.", self.model_size)
+            return self._model
 
-    async def transcribe_Window(self, audio_float32: np.ndarray) -> tuple[str, float]:
+    async def transcribe_window(self, audio_float32: np.ndarray) -> tuple[str, float]:
         """
-        Transcribe a 16kHz float32 numpy array.
+        Transcribe a 16kHz float32 numpy array using Faster-Whisper.
         Returns (transcribed_text, avg_confidence).
         """
-        if not await self.ensure_loaded() or self._model is None:
-            return "", 0.0
-
+        model = await self.ensure_loaded()
         loop = asyncio.get_running_loop()
 
         def _run_whisper() -> tuple[str, float]:
-            segments, _ = self._model.transcribe(
+            segments, _ = model.transcribe(
                 audio_float32,
                 language="en",
                 beam_size=1,
@@ -125,7 +99,7 @@ class FasterWhisperEngine:
                 temperature=0.0,
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=250),
-                condition_on_previous_text=False,
+                condition_on_previous_text=True,
             )
             texts: list[str] = []
             probs: list[float] = []
@@ -133,7 +107,6 @@ class FasterWhisperEngine:
                 cleaned = seg.text.strip()
                 if cleaned:
                     texts.append(cleaned)
-                    # Convert avg_logprob (~ -0.1 to -1.5) into a 0..1 confidence score
                     avg_logprob = getattr(seg, "avg_logprob", -0.25)
                     probs.append(float(np.clip(np.exp(avg_logprob), 0.1, 0.99)))
             joined = " ".join(texts).strip()
@@ -157,16 +130,12 @@ class RollingAudioSession:
         self.whisper_engine = whisper_engine
         self.on_transcript_update = on_transcript_update
 
-        # Store 16kHz float32 samples in a bounded deque (30s max)
         self.max_samples = SAMPLE_RATE * MAX_BUFFER_SECONDS
         self._buffer = np.zeros(0, dtype=np.float32)
         self._has_new_speech = False
         self._running = False
         self._task: Optional[asyncio.Task] = None
-        self.state = TranscriptState(
-            engine="faster-whisper" if whisper_engine.is_available else "web-speech-hybrid"
-        )
-        # Keep timestamped history of segments in the last 30s
+        self.state = TranscriptState(engine=f"faster-whisper ({whisper_engine.model_size})")
         self._history: deque[tuple[float, str]] = deque()
 
     def start(self) -> None:
@@ -202,7 +171,6 @@ class RollingAudioSession:
             return
         float_samples = int16_samples.astype(np.float32) / 32768.0
 
-        # Check RMS energy to see if this chunk contains voice activity
         rms = float(np.sqrt(np.mean(np.square(float_samples))))
         if rms >= SILENCE_RMS_THRESHOLD:
             self._has_new_speech = True
@@ -211,31 +179,24 @@ class RollingAudioSession:
         if self._buffer.size > self.max_samples:
             self._buffer = self._buffer[-self.max_samples :]
 
-    async def ingest_external_transcript(self, text: str, engine: str = "web-speech-api") -> None:
+    async def append_selected_suggestion(self, text: str) -> None:
         """
-        Allows browser Web Speech API interim/final results or simulated role-play
-        inputs to feed directly into the same rolling 30s context pipeline.
+        When the user clicks a suggested completion on screen, append it to the
+        current context so the next Ollama suggestion continues from it.
         """
         cleaned = text.strip()
         if not cleaned:
             return
         now = time.time()
-        self._history.append((now, cleaned))
-        # Prune older than 30s
-        while self._history and (now - self._history[0][0]) > MAX_BUFFER_SECONDS:
-            self._history.popleft()
-
-        # Keep latest text
         self.state.full_text = cleaned
         self.state.last_snippet = TranscriptState.extract_snippet(cleaned)
-        self.state.engine = engine
         self.state.updated_at = now
         await self.on_transcript_update(self.state)
 
     async def _transcription_loop(self) -> None:
         """
         Every ~0.75 seconds, if new voice activity was detected in the rolling audio
-        buffer and Faster-Whisper is available, transcribe the latest window.
+        buffer, transcribe the rolling window using Faster-Whisper.
         """
         window_samples = SAMPLE_RATE * TRANSCRIBE_WINDOW_SECONDS
         min_samples = int(SAMPLE_RATE * MIN_AUDIO_SECONDS)
@@ -246,14 +207,12 @@ class RollingAudioSession:
                 continue
             if self._buffer.size < min_samples:
                 continue
-            if not self.whisper_engine.is_available:
-                continue
 
             self._has_new_speech = False
             audio_slice = self._buffer[-window_samples:].copy()
 
             try:
-                text, confidence = await self.whisper_engine.transcribe_Window(audio_slice)
+                text, confidence = await self.whisper_engine.transcribe_window(audio_slice)
                 if text and text != self.state.full_text:
                     self.state.full_text = text
                     self.state.last_snippet = TranscriptState.extract_snippet(text)

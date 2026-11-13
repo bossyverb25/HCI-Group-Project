@@ -32,32 +32,12 @@
       <section class="context-card" aria-label="Live spoken context">
         <div class="section-header">
           <span class="section-tag">LIVE CONTEXT (LAST FEW WORDS)</span>
-          <span id="stt-engine-badge" class="engine-badge">STT: Faster-Whisper + Hybrid</span>
+          <span id="stt-engine-badge" class="engine-badge">STT: faster-whisper (base.en)</span>
         </div>
 
         <p id="context-snippet" class="context-text placeholder">
-          Press "Listening: ON" or choose a role-play prompt below to begin...
+          Press "Listening: ON" below and start speaking...
         </p>
-
-        <!-- Quick Role-Play Simulator Bar (for testing & Pilot Workshop Demos without speaking) -->
-        <div class="demo-bar">
-          <span class="demo-label">Quick Role-Play Prompts:</span>
-          <button class="chip-btn" data-prompt="Excuse me, I came to the pharmacy because I have">
-            "…because I have"
-          </button>
-          <button class="chip-btn" data-prompt="Hello, I am looking for">
-            "…I am looking for"
-          </button>
-          <button class="chip-btn" data-prompt="Could you tell me how often">
-            "…tell me how often"
-          </button>
-          <button class="chip-btn" data-prompt="So I should take this tablet twice a">
-            "…tablet twice a"
-          </button>
-          <button class="chip-btn" data-prompt="Just so you know, I am allergic">
-            "…I am allergic"
-          </button>
-        </div>
       </section>
 
       <!-- System 3: Center Stage — 2 Big Suggestions -->
@@ -67,7 +47,7 @@
             SUGGESTIONS (PRESS "I'M STUCK" BELOW TO REVEAL)
           </span>
           <div class="meta-pills">
-            <span id="llm-engine-badge" class="engine-badge">Engine: Local</span>
+            <span id="llm-engine-badge" class="engine-badge">LLM: ollama (llama3.2:3b)</span>
             <span id="latency-badge" class="engine-badge">0.0 ms (cached)</span>
           </div>
         </div>
@@ -87,7 +67,7 @@
           <button id="suggestion-card-0" class="suggestion-card high-confidence" data-index="0">
             <div class="card-top">
               <span class="option-number">Option 1</span>
-              <span id="conf-badge-0" class="confidence-badge high">High Confidence (92%)</span>
+              <span id="conf-badge-0" class="confidence-badge high">High Confidence</span>
             </div>
             <div id="suggestion-text-0" class="suggestion-text">—</div>
             <div class="card-footer">Click to use in sentence · Press [↑]</div>
@@ -96,7 +76,7 @@
           <button id="suggestion-card-1" class="suggestion-card medium-confidence" data-index="1">
             <div class="card-top">
               <span class="option-number">Option 2</span>
-              <span id="conf-badge-1" class="confidence-badge medium">Alternative (76%)</span>
+              <span id="conf-badge-1" class="confidence-badge medium">Alternative</span>
             </div>
             <div id="suggestion-text-1" class="suggestion-text">—</div>
             <div class="card-footer">Click to use in sentence · Press [↓]</div>

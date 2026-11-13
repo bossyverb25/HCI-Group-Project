@@ -1,0 +1,6 @@
+.venv/
+1.txt
+__pycache__/
+backend/__pycache__/
+logs/
+docs/notes

@@ -6,9 +6,10 @@ In Prototype v1:
 - Pre-generates and stores a rolling 30-second cache of word & phrase
   suggestions via System 3 so that when the user presses "I'm Stuck (Words)"
   or "I'm Stuck (Phrases)", the suggestions are already cached (0ms latency).
-- Automatically logs all events (listening toggled, cache updated, button
-  pressed, suggestion selected) to anonymised CSV and JSONL files in `logs/`
-  as required by the HCI coursework specification.
+- Prevents concurrent overlapping Ollama requests: only one background
+  generation runs at a time, and if newer speech arrived while it was running,
+  immediately regenerates for the newest transcript.
+- Automatically logs all events to anonymised CSV and JSONL files in `logs/`.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Awaitable, Optional
 
 from backend.suggestion import SuggestionBundle, SuggestionEngine
 from backend.transcription import TranscriptState
@@ -100,68 +101,85 @@ class JudgmentCacheManager:
     triggers for a single participant session.
     """
 
-    def __init__(self, suggestion_engine: SuggestionEngine, hci_logger: HCILogger) -> None:
+    def __init__(
+        self,
+        suggestion_engine: SuggestionEngine,
+        hci_logger: HCILogger,
+        on_cache_ready: Optional[Callable[[SuggestionBundle, int], Awaitable[None]]] = None,
+    ) -> None:
         self.session_id = f"anon-{uuid.uuid4().hex[:8]}"
         self.suggestion_engine = suggestion_engine
         self.hci_logger = hci_logger
+        self.on_cache_ready = on_cache_ready
 
         # Rolling cache of SuggestionBundles over the last 30 seconds
         self._rolling_cache: deque[SuggestionBundle] = deque(maxlen=30)
         self._latest_bundle: Optional[SuggestionBundle] = None
-        self._in_flight_task: Optional[asyncio.Task[SuggestionBundle]] = None
+        self._worker_task: Optional[asyncio.Task[None]] = None
+        self._pending_context: Optional[str] = None
         self._last_context_generated: str = ""
 
     async def initialize_default_cache(self) -> SuggestionBundle:
         """Seed an initial suggestion bundle so the cache is warm before speech even starts."""
         bundle = await self.suggestion_engine.generate("Hello, I would like")
         self._latest_bundle = bundle
+        self._last_context_generated = "Hello, I would like"
         self._rolling_cache.append(bundle)
         return bundle
 
-    async def on_transcript_updated(self, state: TranscriptState) -> SuggestionBundle:
+    async def on_transcript_updated(self, state: TranscriptState) -> None:
         """
-        Called automatically whenever System 1 produces a new transcript snippet.
-        Pre-computes and caches both word and phrase suggestions in the background.
+        Called whenever System 1 produces a new transcript snippet.
+        Queues the newest full transcript for background generation without
+        stacking multiple concurrent Ollama requests.
         """
         context = state.full_text.strip()
         if not context or context == self._last_context_generated:
-            if self._latest_bundle is not None:
-                return self._latest_bundle
-            return await self.initialize_default_cache()
+            return
 
-        self._last_context_generated = context
+        self._pending_context = context
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._process_pending_loop())
 
-        # Prune cached entries older than 30 seconds
-        now = time.time()
-        while self._rolling_cache and (now - self._rolling_cache[0].generated_at) > 30.0:
-            self._rolling_cache.popleft()
+    async def _process_pending_loop(self) -> None:
+        """
+        Processes only the MOST RECENT pending transcript context. If the user kept
+        talking while Ollama was generating, skips stale intermediate states and
+        immediately generates for the newest words.
+        """
+        while self._pending_context is not None:
+            context = self._pending_context
+            self._pending_context = None
+            if context == self._last_context_generated:
+                continue
 
-        async def _compute() -> SuggestionBundle:
             bundle = await self.suggestion_engine.generate(context)
             self._latest_bundle = bundle
-            self._rolling_cache.append(bundle)
-            return bundle
+            self._last_context_generated = context
 
-        self._in_flight_task = asyncio.create_task(_compute())
-        bundle = await self._in_flight_task
-        return bundle
+            # Prune cached entries older than 30 seconds
+            now = time.time()
+            while self._rolling_cache and (now - self._rolling_cache[0].generated_at) > 30.0:
+                self._rolling_cache.popleft()
+            self._rolling_cache.append(bundle)
+
+            if self.on_cache_ready is not None:
+                await self.on_cache_ready(bundle, len(self._rolling_cache))
 
     async def trigger_im_stuck(self, mode: str, fallback_context: str = "") -> dict:
         """
         Triggered when the user clicks 'I'm Stuck (Words)' or 'I'm Stuck (Phrases)'.
-        If an update is currently in-flight, awaits the remaining few milliseconds;
+        If an update is currently in-flight for the latest words, awaits it briefly;
         otherwise returns the warm cached bundle instantaneously (0ms).
         """
         t0 = time.perf_counter()
-        if self._in_flight_task is not None and not self._in_flight_task.done():
+        if self._worker_task is not None and not self._worker_task.done():
             try:
-                await asyncio.wait_for(asyncio.shield(self._in_flight_task), timeout=0.35)
+                await asyncio.wait_for(asyncio.shield(self._worker_task), timeout=1.2)
             except asyncio.TimeoutError:
                 pass
 
-        if self._latest_bundle is None or (
-            fallback_context.strip() and fallback_context.strip() != self._last_context_generated
-        ):
+        if self._latest_bundle is None:
             ctx = fallback_context.strip() or "Hello, I would like"
             self._latest_bundle = await self.suggestion_engine.generate(ctx)
             self._last_context_generated = ctx

@@ -2,9 +2,9 @@
 The Invisible Interpreter — Prototype v1 Server
 -----------------------------------------------
 Coordinates:
-  - System 1: Listening & Transcription (`backend/transcription.py`)
+  - System 1: Listening & Transcription via Faster-Whisper (`backend/transcription.py`)
   - System 2: Judgment & Rolling Cache Manager (`backend/judgment.py`)
-  - System 3: Suggestion Engine (`backend/suggestion.py`)
+  - System 3: Suggestion Engine via Local Ollama (`backend/suggestion.py`)
 and serves the calm-technology Web App UI at `http://localhost:8000`.
 """
 
@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.judgment import HCILogger, JudgmentCacheManager
-from backend.suggestion import SuggestionEngine
+from backend.suggestion import SuggestionBundle, SuggestionEngine
 from backend.transcription import FasterWhisperEngine, RollingAudioSession, TranscriptState
 
 logging.basicConfig(
@@ -41,9 +41,8 @@ hci_logger = HCILogger()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Pre-warm Faster-Whisper in background if available so the first speaker doesn't wait
-    if whisper_engine.is_available:
-        asyncio.create_task(whisper_engine.ensure_loaded())
+    # Pre-warm Faster-Whisper in background so the first speaker doesn't wait
+    asyncio.create_task(whisper_engine.ensure_loaded())
     yield
     await suggestion_engine.close()
 
@@ -64,15 +63,13 @@ async def index() -> FileResponse:
 
 @app.get("/api/status")
 async def status() -> JSONResponse:
-    ollama_ok = await suggestion_engine._check_ollama()
+    ollama_ok = await suggestion_engine.check_ollama()
     return JSONResponse(
         {
             "status": "ok",
-            "whisper_available": whisper_engine.is_available,
-            "whisper_model": whisper_engine.model_size if whisper_engine.is_available else "web-speech-hybrid",
+            "whisper_model": whisper_engine.model_size,
             "ollama_available": ollama_ok,
-            "ollama_model": suggestion_engine.ollama_model if ollama_ok else None,
-            "groq_configured": bool(suggestion_engine.groq_api_key),
+            "ollama_model": suggestion_engine.ollama_model,
         }
     )
 
@@ -80,14 +77,31 @@ async def status() -> JSONResponse:
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     await ws.accept()
-    judgment = JudgmentCacheManager(suggestion_engine=suggestion_engine, hci_logger=hci_logger)
+
+    async def push_cache_ready(bundle: SuggestionBundle, cache_size: int) -> None:
+        try:
+            await ws.send_json(
+                {
+                    "type": "cache_update",
+                    "cache": bundle.to_dict(),
+                    "rolling_cache_size": cache_size,
+                }
+            )
+        except Exception as exc:
+            logger.debug("WebSocket cache_update skipped: %s", exc)
+
+    judgment = JudgmentCacheManager(
+        suggestion_engine=suggestion_engine,
+        hci_logger=hci_logger,
+        on_cache_ready=push_cache_ready,
+    )
 
     async def handle_transcript_update(state: TranscriptState) -> None:
         """
-        Whenever System 1 updates the rolling transcript:
+        Whenever System 1 (Faster-Whisper) updates the rolling transcript:
         1. Immediately send the latest snippet to the Web UI.
-        2. Trigger System 2 & 3 to refresh the rolling suggestion cache in the background
-           and push the warm cache to the client so clicking 'I'm Stuck' takes 0ms.
+        2. Queue System 2 & 3 (Ollama) to refresh the rolling suggestion cache
+           for the newest transcript without stacking overlapping LLM calls.
         """
         try:
             await ws.send_json(
@@ -99,14 +113,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     "engine": state.engine,
                 }
             )
-            bundle = await judgment.on_transcript_updated(state)
-            await ws.send_json(
-                {
-                    "type": "cache_update",
-                    "cache": bundle.to_dict(),
-                    "rolling_cache_size": len(judgment._rolling_cache),
-                }
-            )
+            await judgment.on_transcript_updated(state)
         except Exception as exc:
             logger.debug("WebSocket send skipped: %s", exc)
 
@@ -122,7 +129,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         {
             "type": "session_init",
             "session_id": judgment.session_id,
-            "whisper_available": whisper_engine.is_available,
+            "whisper_model": whisper_engine.model_size,
             "cache": initial_bundle.to_dict(),
         }
     )
@@ -131,20 +138,14 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         while True:
             message = await ws.receive()
             if "bytes" in message and message["bytes"] is not None:
-                # Raw 16kHz 16-bit mono PCM audio streamed from browser microphone
+                # Raw 16kHz 16-bit mono PCM audio streamed from browser microphone to Faster-Whisper
                 audio_session.append_pcm16_bytes(message["bytes"])
 
             elif "text" in message and message["text"] is not None:
                 data = json.loads(message["text"])
                 msg_type = data.get("type", "")
 
-                if msg_type == "browser_transcript":
-                    # Browser Web Speech API or simulated role-play turn
-                    text = data.get("text", "")
-                    engine_name = data.get("engine", "web-speech-api")
-                    await audio_session.ingest_external_transcript(text, engine=engine_name)
-
-                elif msg_type == "im_stuck":
+                if msg_type == "im_stuck":
                     mode = data.get("mode", "words")  # "words" or "phrases"
                     context_override = data.get("context", "")
                     result = await judgment.trigger_im_stuck(mode=mode, fallback_context=context_override)
@@ -161,9 +162,8 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                         selected_suggestion=selected,
                         provider=judgment._latest_bundle.provider if judgment._latest_bundle else "",
                     )
-                    # Append the selected completion to the rolling context so the next suggestion continues naturally
                     combined = f"{audio_session.state.full_text} {selected}".strip()
-                    await audio_session.ingest_external_transcript(combined, engine=audio_session.state.engine)
+                    await audio_session.append_selected_suggestion(combined)
 
                 elif msg_type == "listening_toggled":
                     is_listening = bool(data.get("listening", False))
