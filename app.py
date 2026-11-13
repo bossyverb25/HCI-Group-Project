@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="The Invisible Interpreter (Prototype v1)",
+    title="The Invisible Interpreter",
     version="1.0.0",
     lifespan=lifespan,
 )
