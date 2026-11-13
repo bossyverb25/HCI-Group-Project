@@ -2,20 +2,9 @@
 System 3: Suggestion System (Local Ollama LLM)
 ----------------------------------------------
 Takes the latest conversational snippet (from the last 30 seconds of context)
-and calls the local Ollama LLM (`llama3.2:1b` or `llama3.2:3b`) using true
-RAW token continuation (`/api/generate` with `raw: true`) to generate BOTH:
-  - 2 short word suggestions (1–2 words)
-  - 2 phrase completions (3–7 words)
-along with confidence levels ("high" vs "medium") to support the HCI design
-requirement "Honest about uncertainty".
-
-Why `raw: true`?
-Small 1B/3B models fail when asked to output JSON meta-reasoning about "what the
-next word is" — they just copy words from the start of the prompt.
-With `raw: true`, we feed the user's exact incomplete sentence directly into the
-LLM's token stream so it naturally predicts the next tokens that follow the last
-word, then extract the first 1–2 words (Word suggestion) and full 4–6 words
-(Phrase suggestion) from two distinct continuations!
+and calls the local Ollama LLM (`llama3.2:3b`) to generate up to N (1–10)
+distinct phrase completions of configurable word length (`detail_words`)
+that naturally continue after the speaker's last word.
 """
 
 from __future__ import annotations
@@ -42,7 +31,6 @@ class SuggestionItem:
 @dataclass
 class SuggestionBundle:
     context_snippet: str
-    words: list[SuggestionItem]
     phrases: list[SuggestionItem]
     provider: str
     latency_ms: float
@@ -51,7 +39,6 @@ class SuggestionBundle:
     def to_dict(self) -> dict:
         return {
             "context_snippet": self.context_snippet,
-            "words": [asdict(w) for w in self.words],
             "phrases": [asdict(p) for p in self.phrases],
             "provider": self.provider,
             "latency_ms": round(self.latency_ms, 1),
@@ -61,15 +48,14 @@ class SuggestionBundle:
 
 class SuggestionEngine:
     """
-    Generates rolling word and phrase suggestions using Local Ollama raw token
-    continuation (true causal language modeling after the speaker's last word).
+    Generates rolling phrase completion suggestions using Local Ollama.
     """
 
     def __init__(self) -> None:
         self.ollama_url = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
         self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
         self._model_checked = False
-        self._client = httpx.AsyncClient(timeout=8.0)
+        self._client = httpx.AsyncClient(timeout=10.0)
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -103,25 +89,37 @@ class SuggestionEngine:
         """
         cleaned = text.strip()
         cleaned = re.sub(r"[.?!,;:\-—]+$", "", cleaned).strip()
-        # Collapse consecutive duplicate words like "where where"
         cleaned = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", cleaned, flags=re.IGNORECASE)
         return cleaned[-500:]
 
-    async def _raw_continue(self, stem: str, temperature: float, seed: int, avoid_first_word: str = "") -> str:
-        """
-        Uses Ollama `/api/generate` with `raw: true` so the LLM directly continues the
-        unfinished sentence token-by-token instead of repeating the prompt.
-        """
+    @staticmethod
+    def _clean_phrase(raw: str, context: str, max_words: int = 6) -> str:
+        """Clean punctuation, strip repeated words from the end of context, and trim to `max_words`."""
+        sug = re.sub(r"^[\d\.\)\-\*\s,;:\"'—]+", "", raw.strip())
+        sug = re.sub(r"[.?!,;:\-—\"']+$", "", sug).strip()
+        if not sug:
+            return ""
+
+        ctx_words = re.findall(r"[a-zA-Z']+", context.lower())
+        sug_words = sug.split()
+        if ctx_words and sug_words:
+            for k in range(min(4, len(ctx_words), len(sug_words)), 0, -1):
+                ctx_tail = [w.lower().strip(".,?!") for w in ctx_words[-k:]]
+                sug_head = [w.lower().strip(".,?!") for w in sug_words[:k]]
+                if ctx_tail == sug_head:
+                    sug_words = sug_words[k:]
+                    break
+
+        return " ".join(sug_words[:max_words]).strip()
+
+    async def _raw_continue_single(
+        self, stem: str, temperature: float, seed: int, max_words: int = 6
+    ) -> str:
+        """Run a raw continuation from the speaker's unfinished stem."""
         raw_prompt = (
-            "Transcript of a spoken conversation in a shop or pharmacy:\n"
+            "Transcript of a spoken conversation:\n"
             f"Speaker: {stem}"
         )
-        if avoid_first_word:
-            raw_prompt = (
-                "Transcript of a spoken conversation (using different phrasing):\n"
-                f"Speaker: {stem}"
-            )
-
         payload = {
             "model": self.ollama_model,
             "prompt": raw_prompt,
@@ -129,84 +127,121 @@ class SuggestionEngine:
             "stream": False,
             "options": {
                 "temperature": temperature,
-                "top_p": 0.9,
+                "top_p": 0.92,
                 "repeat_penalty": 1.25,
                 "seed": seed,
-                "num_predict": 10,
-                "stop": ["\n", ".", "?", "!", "\"", "Speaker:", "Assistant:"],
+                "num_predict": max(4, int(max_words * 1.6)),
+                "stop": ["\n", ".", "?", "!", "\"", "Speaker:"],
             },
         }
         resp = await self._client.post(f"{self.ollama_url}/api/generate", json=payload)
         resp.raise_for_status()
-        continuation = resp.json().get("response", "").strip()
-        # Clean stray punctuation at edges
-        continuation = re.sub(r"^[,;:\-—\s]+", "", continuation)
-        continuation = re.sub(r"[.?!,;:\-—\"']+$", "", continuation).strip()
-        return continuation
+        text = resp.json().get("response", "")
+        return self._clean_phrase(text, stem, max_words=max_words)
 
-    @staticmethod
-    def _extract_word_and_phrase(continuation: str) -> tuple[str, str]:
+    async def _generate_list_completions(self, stem: str, count: int, max_words: int = 6) -> list[str]:
         """
-        From a natural 4-8 word continuation (e.g. 'cold medicine on these shelves'),
-        extract:
-          - word suggestion: first 1–2 words (if the first word is a short article/preposition
-            like 'a', 'the', 'to', 'for', 'some', include the 2nd word so it's meaningful!)
-          - phrase suggestion: first 4–6 words
+        Ask `llama3.2:3b` to generate `count` distinct continuations of ~`max_words` words each.
         """
-        tokens = continuation.split()
-        if not tokens:
-            return "...", "..."
+        min_w = max(1, max_words - 2)
+        prompt = (
+            f"Give {count} different ways ({min_w} to {max_words} words each) to finish the end of this incomplete spoken sentence.\n"
+            "Only write the NEW words that come immediately after the last word. Do not repeat the sentence.\n\n"
+            f"Incomplete sentence: \"{stem} ...\"\n"
+            "Continuations (one per line):\n1."
+        )
+        payload = {
+            "model": self.ollama_model,
+            "prompt": prompt,
+            "raw": True,
+            "stream": False,
+            "options": {
+                "temperature": 0.7,
+                "top_p": 0.92,
+                "repeat_penalty": 1.2,
+                "num_predict": max(30, count * (max_words + 4)),
+                "stop": ["\n\n", "Incomplete sentence:"],
+            },
+        }
+        resp = await self._client.post(f"{self.ollama_url}/api/generate", json=payload)
+        resp.raise_for_status()
+        raw_text = "1. " + resp.json().get("response", "")
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        results: list[str] = []
+        for line in lines:
+            cleaned = self._clean_phrase(line, stem, max_words=max_words)
+            if cleaned and cleaned.lower() not in {r.lower() for r in results}:
+                results.append(cleaned)
+        return results
 
-        stop_starters = {"a", "an", "the", "to", "for", "of", "in", "on", "at", "with", "some", "my", "your", "very", "more"}
-        if len(tokens) >= 2 and tokens[0].lower().strip(".,?!") in stop_starters:
-            word_sug = " ".join(tokens[:2])
-        else:
-            word_sug = tokens[0]
-
-        phrase_sug = " ".join(tokens[:6])
-        return word_sug, phrase_sug
-
-    async def generate(self, transcript_context: str) -> SuggestionBundle:
+    async def generate(
+        self, transcript_context: str, count: int = 6, detail_words: int = 6
+    ) -> SuggestionBundle:
         """
-        Generate 2 distinct word suggestions and 2 distinct phrase suggestions by running
-        two fast parallel raw-token continuations (`num_predict: 10`) from the exact end
-        of the user's spoken stem.
+        Generate `count` (1..10) distinct phrase completion suggestions of up to
+        `detail_words` (1..12) words each for the given transcript context.
         """
         start = time.perf_counter()
+        count = max(1, min(10, int(count)))
+        detail_words = max(1, min(12, int(detail_words)))
         await self.check_ollama()
-        cleaned = self._clean_context(transcript_context) or "Hello, I would like to buy"
+        cleaned = self._clean_context(transcript_context) or "Hello, I would like to find the"
 
         try:
-            # Generate two diverse continuations in parallel (only 10 tokens each -> very fast!)
-            cont_1, cont_2 = await asyncio.gather(
-                self._raw_continue(cleaned, temperature=0.15, seed=101),
-                self._raw_continue(cleaned, temperature=0.85, seed=202, avoid_first_word="true"),
-            )
+            phrases_text: list[str] = []
 
-            w1, p1 = self._extract_word_and_phrase(cont_1)
-            w2, p2 = self._extract_word_and_phrase(cont_2)
+            if count <= 3:
+                temps = [0.15, 0.75, 1.0][:count]
+                seeds = [101, 202, 303][:count]
+                raw_results = await asyncio.gather(
+                    *[
+                        self._raw_continue_single(cleaned, t, s, max_words=detail_words)
+                        for t, s in zip(temps, seeds)
+                    ]
+                )
+                for r in raw_results:
+                    if r and r.lower() not in {p.lower() for p in phrases_text}:
+                        phrases_text.append(r)
 
-            # If the second sample happened to start with the exact same word, do one fast high-temp retry
-            if w2.lower() == w1.lower():
-                cont_3 = await self._raw_continue(cleaned, temperature=1.1, seed=303, avoid_first_word="true")
-                w3, p3 = self._extract_word_and_phrase(cont_3)
-                if w3 and w3.lower() != w1.lower():
-                    w2, p2 = w3, p3
-                elif len(cont_1.split()) >= 3:
-                    # Use the 2nd-3rd word of cont_1 as alternative if still identical
-                    w2 = " ".join(cont_1.split()[1:3])
+            if len(phrases_text) < count:
+                top_raw, list_items = await asyncio.gather(
+                    self._raw_continue_single(cleaned, temperature=0.15, seed=101, max_words=detail_words)
+                    if not phrases_text
+                    else asyncio.sleep(0, result=""),
+                    self._generate_list_completions(cleaned, count + 2, max_words=detail_words),
+                )
+                if top_raw and top_raw.lower() not in {p.lower() for p in phrases_text}:
+                    phrases_text.insert(0, top_raw)
+                for item in list_items:
+                    if item and item.lower() not in {p.lower() for p in phrases_text}:
+                        phrases_text.append(item)
+                    if len(phrases_text) >= count:
+                        break
+
+            idx = 1
+            while len(phrases_text) < count:
+                extra = await self._raw_continue_single(
+                    cleaned, temperature=0.6 + 0.1 * idx, seed=400 + idx, max_words=detail_words
+                )
+                if extra and extra.lower() not in {p.lower() for p in phrases_text}:
+                    phrases_text.append(extra)
+                else:
+                    phrases_text.append(f"option {len(phrases_text) + 1}")
+                idx += 1
+                if idx > 4:
+                    break
+
+            phrases_text = phrases_text[:count]
+            phrase_items: list[SuggestionItem] = []
+            for i, text in enumerate(phrases_text):
+                score = round(max(0.55, 0.92 - i * 0.05), 2)
+                confidence = "high" if i == 0 else "medium"
+                phrase_items.append(SuggestionItem(text=text, confidence=confidence, score=score))
 
             latency_ms = (time.perf_counter() - start) * 1000.0
             return SuggestionBundle(
                 context_snippet=cleaned,
-                words=[
-                    SuggestionItem(text=w1, confidence="high", score=0.92),
-                    SuggestionItem(text=w2, confidence="medium", score=0.76),
-                ],
-                phrases=[
-                    SuggestionItem(text=p1, confidence="high", score=0.90),
-                    SuggestionItem(text=p2, confidence="medium", score=0.74),
-                ],
+                phrases=phrase_items,
                 provider=f"ollama ({self.ollama_model})",
                 latency_ms=latency_ms,
                 generated_at=time.time(),
@@ -216,13 +251,9 @@ class SuggestionEngine:
             latency_ms = (time.perf_counter() - start) * 1000.0
             return SuggestionBundle(
                 context_snippet=cleaned,
-                words=[
-                    SuggestionItem(text="...", confidence="high", score=0.5),
-                    SuggestionItem(text="...", confidence="medium", score=0.5),
-                ],
                 phrases=[
-                    SuggestionItem(text="...", confidence="high", score=0.5),
-                    SuggestionItem(text="...", confidence="medium", score=0.5),
+                    SuggestionItem(text="...", confidence="high" if i == 0 else "medium", score=0.5)
+                    for i in range(count)
                 ],
                 provider=f"ollama (error: {type(exc).__name__})",
                 latency_ms=latency_ms,

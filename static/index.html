@@ -8,16 +8,15 @@
 </head>
 <body>
   <div class="app-shell">
-    <!-- Top Bar: Calm Status & Privacy Indicator -->
+    <!-- Top Bar: Status & Privacy Indicator -->
     <header class="top-bar">
       <div class="brand">
         <span class="brand-title">The Invisible Interpreter</span>
-        <span class="brand-subtitle">Prototype v1 · Calm Conversational Aid</span>
       </div>
 
       <div class="status-cluster">
-        <div id="cache-badge" class="cache-badge" title="Background rolling 30s suggestion cache status">
-          Cache: <span id="cache-state">Warm</span>
+        <div id="connection-badge" class="cache-badge">
+          <span id="connection-state">Disconnected</span>
         </div>
         <div id="listening-pill" class="listening-pill off" role="status" aria-live="polite">
           <span id="red-dot" class="status-dot"></span>
@@ -40,79 +39,74 @@
         </p>
       </section>
 
-      <!-- System 3: Center Stage — 2 Big Suggestions -->
+      <!-- System 3: Center Stage — Dynamic (1-10) Phrase Suggestions -->
       <section class="suggestions-stage" aria-live="assertive">
         <div class="suggestions-header">
           <span id="suggestion-mode-title" class="section-tag">
-            SUGGESTIONS (PRESS "I'M STUCK" BELOW TO REVEAL)
+            SUGGESTIONS
           </span>
           <div class="meta-pills">
             <span id="llm-engine-badge" class="engine-badge">LLM: ollama (llama3.2:3b)</span>
-            <span id="latency-badge" class="engine-badge">0.0 ms (cached)</span>
           </div>
         </div>
 
-        <!-- Calm idle state when user hasn't asked for help -->
+        <!-- Idle state when user hasn't asked for help -->
         <div id="calm-idle-box" class="calm-idle-box">
-          <div class="calm-wave"></div>
-          <p class="calm-title">Staying at the edge of attention</p>
           <p class="calm-desc">
-            Suggestions are continuously pre-cached in the background from the last 30s of speech.<br />
-            Press <strong>I'm Stuck (Words)</strong> or <strong>I'm Stuck (Phrases)</strong> whenever you need a hint.
+            Press <strong>I'm Stuck</strong> whenever you need a hint. (Spacebar)
           </p>
         </div>
 
-        <!-- 2 Big Suggestion Cards (Hidden until "I'm Stuck" is pressed) -->
-        <div id="suggestions-grid" class="suggestions-grid hidden">
-          <button id="suggestion-card-0" class="suggestion-card high-confidence" data-index="0">
-            <div class="card-top">
-              <span class="option-number">Option 1</span>
-              <span id="conf-badge-0" class="confidence-badge high">High Confidence</span>
-            </div>
-            <div id="suggestion-text-0" class="suggestion-text">—</div>
-            <div class="card-footer">Click to use in sentence · Press [↑]</div>
-          </button>
-
-          <button id="suggestion-card-1" class="suggestion-card medium-confidence" data-index="1">
-            <div class="card-top">
-              <span class="option-number">Option 2</span>
-              <span id="conf-badge-1" class="confidence-badge medium">Alternative</span>
-            </div>
-            <div id="suggestion-text-1" class="suggestion-text">—</div>
-            <div class="card-footer">Click to use in sentence · Press [↓]</div>
-          </button>
-        </div>
-
-        <div id="dismiss-row" class="dismiss-row hidden">
-          <button id="btn-dismiss" class="btn-subtle">Hide suggestions (Esc)</button>
-        </div>
+        <!-- Dynamic Suggestion Cards Grid (non-clickable display cards) -->
+        <div id="suggestions-grid" class="suggestions-grid hidden"></div>
       </section>
     </main>
 
-    <!-- Bottom Control Bar: Listening Toggle + Manual "I'm Stuck" Word/Phrase Buttons -->
+    <!-- Collapsible Settings Menu above the buttons (Hidden by default) -->
+    <section id="settings-menu" class="settings-menu hidden" aria-label="Suggestion settings">
+      <div class="slider-row">
+        <label for="suggestion-count-slider" class="slider-label">
+          Suggestions: <strong id="suggestion-count-value">6</strong>
+        </label>
+        <input
+          type="range"
+          id="suggestion-count-slider"
+          class="suggestion-slider"
+          min="1"
+          max="10"
+          value="6"
+        />
+      </div>
+
+      <div class="slider-row">
+        <label for="detail-slider" class="slider-label">
+          Detail: <strong id="detail-value">6</strong> words
+        </label>
+        <input
+          type="range"
+          id="detail-slider"
+          class="suggestion-slider"
+          min="1"
+          max="12"
+          value="6"
+        />
+      </div>
+    </section>
+
+    <!-- Bottom Control Bar: Listening Toggle + I'm Stuck Button + Settings Icon Button -->
     <footer class="control-bar">
       <button id="btn-toggle-listen" class="ctrl-btn toggle-btn off" aria-pressed="false">
         <span class="btn-icon" id="toggle-icon">🎙️</span>
-        <div class="btn-labels">
-          <span class="btn-main" id="toggle-text">Listening: OFF</span>
-          <span class="btn-sub">Privacy switch · Shortcut [L]</span>
-        </div>
+        <span class="btn-main" id="toggle-text">Listening: OFF</span>
       </button>
 
-      <button id="btn-stuck-words" class="ctrl-btn stuck-btn words-btn">
-        <span class="btn-icon">💬</span>
-        <div class="btn-labels">
-          <span class="btn-main">I'm Stuck — Words</span>
-          <span class="btn-sub">Suggest 1–2 next words · Shortcut [1]</span>
-        </div>
+      <button id="btn-stuck" class="ctrl-btn stuck-btn phrases-btn">
+        <span class="btn-icon" id="stuck-icon">💬</span>
+        <span class="btn-main" id="stuck-text">I'm Stuck</span>
       </button>
 
-      <button id="btn-stuck-phrases" class="ctrl-btn stuck-btn phrases-btn">
-        <span class="btn-icon">✨</span>
-        <div class="btn-labels">
-          <span class="btn-main">I'm Stuck — Phrases</span>
-          <span class="btn-sub">Complete whole phrase · Shortcut [2]</span>
-        </div>
+      <button id="btn-settings" class="ctrl-btn settings-btn" aria-label="Settings" title="Settings">
+        <span class="btn-icon">⚙️</span>
       </button>
     </footer>
   </div>

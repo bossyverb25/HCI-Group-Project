@@ -5,7 +5,7 @@ Coordinates:
   - System 1: Listening & Transcription via Faster-Whisper (`backend/transcription.py`)
   - System 2: Judgment & Rolling Cache Manager (`backend/judgment.py`)
   - System 3: Suggestion Engine via Local Ollama (`backend/suggestion.py`)
-and serves the calm-technology Web App UI at `http://localhost:8000`.
+and serves the Web App UI at `http://localhost:8000`.
 """
 
 from __future__ import annotations
@@ -41,7 +41,6 @@ hci_logger = HCILogger()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Pre-warm Faster-Whisper in background so the first speaker doesn't wait
     asyncio.create_task(whisper_engine.ensure_loaded())
     yield
     await suggestion_engine.close()
@@ -97,12 +96,6 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     )
 
     async def handle_transcript_update(state: TranscriptState) -> None:
-        """
-        Whenever System 1 (Faster-Whisper) updates the rolling transcript:
-        1. Immediately send the latest snippet to the Web UI.
-        2. Queue System 2 & 3 (Ollama) to refresh the rolling suggestion cache
-           for the newest transcript without stacking overlapping LLM calls.
-        """
         try:
             await ws.send_json(
                 {
@@ -123,7 +116,6 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     )
     audio_session.start()
 
-    # Send initial warm cache on connect
     initial_bundle = await judgment.initialize_default_cache()
     await ws.send_json(
         {
@@ -138,7 +130,6 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         while True:
             message = await ws.receive()
             if "bytes" in message and message["bytes"] is not None:
-                # Raw 16kHz 16-bit mono PCM audio streamed from browser microphone to Faster-Whisper
                 audio_session.append_pcm16_bytes(message["bytes"])
 
             elif "text" in message and message["text"] is not None:
@@ -146,30 +137,30 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 msg_type = data.get("type", "")
 
                 if msg_type == "im_stuck":
-                    mode = data.get("mode", "words")  # "words" or "phrases"
+                    count = data.get("count", judgment.suggestion_count)
+                    detail_words = data.get("detail_words", judgment.detail_words)
                     context_override = data.get("context", "")
-                    result = await judgment.trigger_im_stuck(mode=mode, fallback_context=context_override)
+                    result = await judgment.trigger_im_stuck(
+                        count=count, detail_words=detail_words, fallback_context=context_override
+                    )
                     await ws.send_json({"type": "im_stuck_result", **result})
 
-                elif msg_type == "suggestion_selected":
-                    selected = data.get("text", "")
-                    mode = data.get("mode", "")
-                    hci_logger.log_event(
-                        session_id=judgment.session_id,
-                        event_type="suggestion_used",
-                        mode=mode,
-                        context_snippet=audio_session.state.last_snippet,
-                        selected_suggestion=selected,
-                        provider=judgment._latest_bundle.provider if judgment._latest_bundle else "",
+                elif msg_type == "update_settings":
+                    count = data.get("count")
+                    detail_words = data.get("detail_words")
+                    await judgment.update_settings(
+                        count=count,
+                        detail_words=detail_words,
+                        current_context=audio_session.state.full_text,
                     )
-                    combined = f"{audio_session.state.full_text} {selected}".strip()
-                    await audio_session.append_selected_suggestion(combined)
 
                 elif msg_type == "listening_toggled":
                     is_listening = bool(data.get("listening", False))
                     hci_logger.log_event(
                         session_id=judgment.session_id,
                         event_type="listening_on" if is_listening else "listening_off",
+                        num_suggestions=judgment.suggestion_count,
+                        detail_words=judgment.detail_words,
                         context_snippet=audio_session.state.last_snippet,
                     )
 

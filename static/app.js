@@ -2,39 +2,41 @@
  * The Invisible Interpreter — Prototype v1 Frontend Client
  * --------------------------------------------------------
  * - Streams 16kHz mono PCM audio over WebSocket exclusively to Faster-Whisper (`backend/transcription.py`).
- * - Maintains the latest pre-generated `words` and `phrases` suggestion bundle pushed from
+ * - Maintains the latest pre-generated phrase completion bundle pushed from
  *   the backend's 30-second rolling Ollama cache (`backend/judgment.py`).
- * - Immediately reveals the 2 big suggestions (0ms perceived latency) when the user clicks
- *   "I'm Stuck — Words" or "I'm Stuck — Phrases", while logging all events to the backend.
+ * - Settings menu (hidden by default, toggled via ⚙️ button) has two sliders:
+ *     1. Suggestions (1–10, default 6)
+ *     2. Detail (1–12 words per suggestion, default 6)
+ * - "I'm Stuck" button (and Spacebar) toggles between showing suggestions ("Hide Suggestions")
+ *   and hiding them ("I'm Stuck").
  */
 
 (() => {
   // UI Elements
   const listeningPill = document.getElementById("listening-pill");
   const listeningLabel = document.getElementById("listening-label");
-  const cacheStateEl = document.getElementById("cache-state");
+  const connectionBadge = document.getElementById("connection-badge");
+  const connectionStateEl = document.getElementById("connection-state");
   const sttEngineBadge = document.getElementById("stt-engine-badge");
   const llmEngineBadge = document.getElementById("llm-engine-badge");
-  const latencyBadge = document.getElementById("latency-badge");
   const contextSnippetEl = document.getElementById("context-snippet");
 
   const calmIdleBox = document.getElementById("calm-idle-box");
   const suggestionsGrid = document.getElementById("suggestions-grid");
-  const dismissRow = document.getElementById("dismiss-row");
   const suggestionModeTitle = document.getElementById("suggestion-mode-title");
 
-  const card0 = document.getElementById("suggestion-card-0");
-  const card1 = document.getElementById("suggestion-card-1");
-  const text0 = document.getElementById("suggestion-text-0");
-  const text1 = document.getElementById("suggestion-text-1");
-  const conf0 = document.getElementById("conf-badge-0");
-  const conf1 = document.getElementById("conf-badge-1");
+  const settingsMenu = document.getElementById("settings-menu");
+  const btnSettings = document.getElementById("btn-settings");
+
+  const countSliderEl = document.getElementById("suggestion-count-slider");
+  const countValEl = document.getElementById("suggestion-count-value");
+  const detailSliderEl = document.getElementById("detail-slider");
+  const detailValEl = document.getElementById("detail-value");
 
   const btnToggleListen = document.getElementById("btn-toggle-listen");
   const toggleText = document.getElementById("toggle-text");
-  const btnStuckWords = document.getElementById("btn-stuck-words");
-  const btnStuckPhrases = document.getElementById("btn-stuck-phrases");
-  const btnDismiss = document.getElementById("btn-dismiss");
+  const btnStuck = document.getElementById("btn-stuck");
+  const stuckText = document.getElementById("stuck-text");
 
   // State
   let ws = null;
@@ -42,20 +44,19 @@
   let audioCtx = null;
   let mediaStream = null;
   let workletNode = null;
-  let activeMode = null; // "words" | "phrases" | null
+  let isShowingSuggestions = false;
+  let suggestionCount = parseInt(countSliderEl.value, 10) || 6;
+  let detailWords = parseInt(detailSliderEl.value, 10) || 6;
   let latestTranscript = "";
 
   // Rolling pre-generated cache pushed continuously from the server
   let warmCache = {
-    words: [
-      { text: "...", confidence: "high", score: 0.9 },
-      { text: "...", confidence: "medium", score: 0.75 },
-    ],
-    phrases: [
-      { text: "...", confidence: "high", score: 0.9 },
-      { text: "...", confidence: "medium", score: 0.75 },
-    ],
-    provider: "ollama",
+    phrases: Array.from({ length: 6 }, (_, i) => ({
+      text: "...",
+      confidence: i === 0 ? "high" : "medium",
+      score: Math.max(0.55, 0.92 - i * 0.05),
+    })),
+    provider: "ollama (llama3.2:3b)",
     latency_ms: 0.0,
   };
 
@@ -65,7 +66,15 @@
     ws.binaryType = "arraybuffer";
 
     ws.onopen = () => {
-      cacheStateEl.textContent = "Warm (Ready)";
+      connectionStateEl.textContent = "Connected";
+      connectionBadge.classList.add("connected");
+      ws.send(
+        JSON.stringify({
+          type: "update_settings",
+          count: suggestionCount,
+          detail_words: detailWords,
+        })
+      );
     };
 
     ws.onmessage = (event) => {
@@ -78,7 +87,8 @@
     };
 
     ws.onclose = () => {
-      cacheStateEl.textContent = "Reconnecting…";
+      connectionStateEl.textContent = "Disconnected";
+      connectionBadge.classList.remove("connected");
       setTimeout(connectWebSocket, 1500);
     };
   }
@@ -103,102 +113,99 @@
       if (msg.cache) {
         warmCache = msg.cache;
         llmEngineBadge.textContent = `LLM: ${msg.cache.provider}`;
-        cacheStateEl.textContent = `Warm (${msg.rolling_cache_size || 1} cached)`;
-        if (activeMode) {
-          renderSuggestionsFromCache(activeMode, 0.0);
+        if (isShowingSuggestions) {
+          renderSuggestionsFromCache(0.0);
         }
       }
     } else if (msg.type === "im_stuck_result") {
       if (msg.all_cached) {
         warmCache = msg.all_cached;
       }
-      renderSuggestionsList(
-        msg.mode,
-        msg.suggestions,
-        msg.cache_retrieval_ms ?? 0.0,
-        warmCache.provider
-      );
+      if (isShowingSuggestions) {
+        renderSuggestionsList(
+          msg.suggestions,
+          msg.cache_retrieval_ms ?? 0.0,
+          warmCache.provider
+        );
+      }
     }
   }
 
-  // Instant 0ms Reveal from Rolling Cache + Log to Backend
-  function triggerImStuck(mode) {
-    activeMode = mode;
+  // Toggle between showing suggestions and hiding them
+  function toggleSuggestions() {
+    if (isShowingSuggestions) {
+      hideSuggestions();
+    } else {
+      showSuggestions();
+    }
+  }
+
+  function showSuggestions() {
+    isShowingSuggestions = true;
+    stuckText.textContent = "Hide Suggestions";
+    btnStuck.classList.add("active");
+
     const t0 = performance.now();
-    renderSuggestionsFromCache(mode, performance.now() - t0);
+    renderSuggestionsFromCache(performance.now() - t0);
 
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(
         JSON.stringify({
           type: "im_stuck",
-          mode: mode,
+          count: suggestionCount,
+          detail_words: detailWords,
           context: latestTranscript,
         })
       );
     }
   }
 
-  function renderSuggestionsFromCache(mode, retrievalMs) {
-    const items = mode === "words" ? warmCache.words : warmCache.phrases;
-    renderSuggestionsList(mode, items, retrievalMs, warmCache.provider);
+  function hideSuggestions() {
+    isShowingSuggestions = false;
+    stuckText.textContent = "I'm Stuck";
+    btnStuck.classList.remove("active");
+    suggestionsGrid.classList.add("hidden");
+    calmIdleBox.classList.remove("hidden");
+    suggestionModeTitle.textContent = "SUGGESTIONS";
   }
 
-  function renderSuggestionsList(mode, items, retrievalMs, provider) {
-    if (!items || items.length < 2) return;
+  function renderSuggestionsFromCache(retrievalMs) {
+    const items = (warmCache.phrases || []).slice(0, suggestionCount);
+    renderSuggestionsList(items, retrievalMs, warmCache.provider);
+  }
+
+  function renderSuggestionsList(items, retrievalMs, provider) {
+    if (!items || items.length === 0) return;
 
     calmIdleBox.classList.add("hidden");
     suggestionsGrid.classList.remove("hidden");
-    dismissRow.classList.remove("hidden");
 
-    suggestionModeTitle.textContent =
-      mode === "words"
-        ? "NEXT WORD SUGGESTIONS (1–2 WORDS)"
-        : "PHRASE COMPLETION SUGGESTIONS";
+    suggestionModeTitle.textContent = "PHRASE COMPLETION SUGGESTIONS";
 
     if (provider) {
       llmEngineBadge.textContent = `LLM: ${provider}`;
     }
-    latencyBadge.textContent = `${retrievalMs.toFixed(1)} ms (from rolling cache)`;
 
-    text0.textContent = items[0].text;
-    const pct0 = Math.round((items[0].score || 0.9) * 100);
-    conf0.textContent =
-      items[0].confidence === "high"
-        ? `High Confidence (${pct0}%)`
-        : `Alternative (${pct0}%)`;
+    suggestionsGrid.innerHTML = "";
+    items.slice(0, suggestionCount).forEach((item, idx) => {
+      const isHigh = item.confidence === "high" || idx === 0;
+      const pct = Math.round((item.score || Math.max(0.55, 0.9 - idx * 0.05)) * 100);
 
-    text1.textContent = items[1].text;
-    const pct1 = Math.round((items[1].score || 0.75) * 100);
-    conf1.textContent =
-      items[1].confidence === "high"
-        ? `High Confidence (${pct1}%)`
-        : `Alternative (${pct1}%)`;
-  }
-
-  function hideSuggestions() {
-    activeMode = null;
-    suggestionsGrid.classList.add("hidden");
-    dismissRow.classList.add("hidden");
-    calmIdleBox.classList.remove("hidden");
-    suggestionModeTitle.textContent =
-      'SUGGESTIONS (PRESS "I\'M STUCK" BELOW TO REVEAL)';
-  }
-
-  function selectSuggestion(index) {
-    if (!activeMode) return;
-    const chosenText = index === 0 ? text0.textContent : text1.textContent;
-    if (!chosenText || chosenText === "—") return;
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: "suggestion_selected",
-          mode: activeMode,
-          text: chosenText,
-        })
-      );
-    }
-    hideSuggestions();
+      const card = document.createElement("div");
+      card.className = `suggestion-card ${isHigh ? "high-confidence" : "medium-confidence"}`;
+      card.innerHTML = `
+        <div class="card-top">
+          <span class="option-number">Option ${idx + 1}</span>
+          <span class="confidence-badge ${isHigh ? "high" : "medium"}">
+            ${isHigh ? `High Confidence (${pct}%)` : `Alternative (${pct}%)`}
+          </span>
+        </div>
+        <div class="suggestion-text"></div>
+      `;
+      const trimmedWords = (item.text || "").split(/\s+/).slice(0, detailWords).join(" ");
+      card.querySelector(".suggestion-text").textContent = trimmedWords;
+      suggestionsGrid.appendChild(card);
+    });
   }
 
   // Audio Capture: 16kHz PCM AudioWorklet -> Faster-Whisper
@@ -261,7 +268,7 @@
     if (isListening) {
       listeningPill.classList.remove("off");
       listeningPill.classList.add("on");
-      listeningLabel.textContent = "Listening & Caching";
+      listeningLabel.textContent = "Listening";
       btnToggleListen.classList.remove("off");
       btnToggleListen.classList.add("on");
       btnToggleListen.setAttribute("aria-pressed", "true");
@@ -277,6 +284,40 @@
     }
   }
 
+  function pushSettingsUpdate() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: "update_settings",
+          count: suggestionCount,
+          detail_words: detailWords,
+        })
+      );
+    }
+    if (isShowingSuggestions) {
+      showSuggestions();
+    }
+  }
+
+  // Sliders inside Settings Menu
+  countSliderEl.addEventListener("input", () => {
+    suggestionCount = parseInt(countSliderEl.value, 10) || 6;
+    countValEl.textContent = String(suggestionCount);
+    pushSettingsUpdate();
+  });
+
+  detailSliderEl.addEventListener("input", () => {
+    detailWords = parseInt(detailSliderEl.value, 10) || 6;
+    detailValEl.textContent = String(detailWords);
+    pushSettingsUpdate();
+  });
+
+  // Settings menu toggle
+  btnSettings.addEventListener("click", () => {
+    settingsMenu.classList.toggle("hidden");
+    btnSettings.classList.toggle("open");
+  });
+
   btnToggleListen.addEventListener("click", () => {
     if (isListening) {
       stopListening();
@@ -285,32 +326,14 @@
     }
   });
 
-  btnStuckWords.addEventListener("click", () => triggerImStuck("words"));
-  btnStuckPhrases.addEventListener("click", () => triggerImStuck("phrases"));
-  btnDismiss.addEventListener("click", hideSuggestions);
+  btnStuck.addEventListener("click", () => toggleSuggestions());
 
-  card0.addEventListener("click", () => selectSuggestion(0));
-  card1.addEventListener("click", () => selectSuggestion(1));
-
+  // Spacebar toggles suggestions on/off
   window.addEventListener("keydown", (e) => {
     if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
-    if (e.key === "1" || e.key === "ArrowLeft") {
+    if (e.code === "Space" || e.key === " ") {
       e.preventDefault();
-      triggerImStuck("words");
-    } else if (e.key === "2" || e.key === "ArrowRight") {
-      e.preventDefault();
-      triggerImStuck("phrases");
-    } else if (e.key.toLowerCase() === "l") {
-      e.preventDefault();
-      btnToggleListen.click();
-    } else if (e.key === "Escape") {
-      hideSuggestions();
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      selectSuggestion(0);
-    } else if (e.key === "ArrowDown") {
-      e.preventDefault();
-      selectSuggestion(1);
+      toggleSuggestions();
     }
   });
 
