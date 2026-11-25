@@ -41,6 +41,12 @@ bash setup_ubuntu.sh
 bash setup_fedora.sh
 ```
 
+### macOS (Apple Silicon & Intel)
+```bash
+bash setup_mac.sh
+```
+*(Subsequently use `bash start_mac.sh` to start and `bash uninstall_mac.sh` to clean up).*
+
 ---
 
 ## AI-Use & Simulation Statement (Coursework Requirement)
