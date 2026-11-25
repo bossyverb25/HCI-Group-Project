@@ -4,11 +4,9 @@
  * - Streams 16kHz mono PCM audio over WebSocket exclusively to Faster-Whisper (`backend/transcription.py`).
  * - Maintains the latest pre-generated phrase completion bundle pushed from
  *   the backend's 30-second rolling Ollama cache (`backend/judgment.py`).
- * - Settings menu (hidden by default, toggled via ⚙️ button) has two sliders:
- *     1. Suggestions (1–10, default 6)
- *     2. Detail (1–12 words per suggestion, default 6)
- * - "I'm Stuck" button (and Spacebar) toggles between showing suggestions ("Hide Suggestions")
- *   and hiding them ("I'm Stuck").
+ * - Clicking "I'm Stuck" (or Spacebar) displays a snapshot of the latest set of suggestions
+ *   (no hide-suggestions toggle; stays at "I'm Stuck").
+ * - Clicking the top-right Mic Off / Listening pill toggles the microphone on/off.
  */
 
 (() => {
@@ -17,52 +15,50 @@
   const listeningLabel = document.getElementById("listening-label");
   const connectionBadge = document.getElementById("connection-badge");
   const connectionStateEl = document.getElementById("connection-state");
-  const sttEngineBadge = document.getElementById("stt-engine-badge");
-  const llmEngineBadge = document.getElementById("llm-engine-badge");
   const contextSnippetEl = document.getElementById("context-snippet");
 
+  const blurTarget = document.getElementById("blur-target");
+  const micOverlay = document.getElementById("mic-overlay");
+  const btnOverlayMic = document.getElementById("btn-overlay-mic");
+
   const calmIdleBox = document.getElementById("calm-idle-box");
-  const suggestionsGrid = document.getElementById("suggestions-grid");
-  const suggestionModeTitle = document.getElementById("suggestion-mode-title");
+  const suggestionsList = document.getElementById("suggestions-list");
 
   const settingsMenu = document.getElementById("settings-menu");
   const btnSettings = document.getElementById("btn-settings");
-
   const countSliderEl = document.getElementById("suggestion-count-slider");
   const countValEl = document.getElementById("suggestion-count-value");
   const detailSliderEl = document.getElementById("detail-slider");
   const detailValEl = document.getElementById("detail-value");
+  const settingsLangSelect = document.getElementById("settings-language-select");
+  const overlayLangSelect = document.getElementById("overlay-language-select");
 
-  const btnToggleListen = document.getElementById("btn-toggle-listen");
-  const toggleText = document.getElementById("toggle-text");
-  const btnStuck = document.getElementById("btn-stuck");
-  const stuckText = document.getElementById("stuck-text");
+  const btnPauseMic = document.getElementById("btn-pause-mic");
+  const btnPrimaryAction = document.getElementById("btn-primary-action");
+  const primaryActionText = document.getElementById("primary-action-text");
 
   // State
   let ws = null;
   let isListening = false;
+  let hasStartedMic = false;
   let audioCtx = null;
   let mediaStream = null;
   let workletNode = null;
-  let isShowingSuggestions = false;
-  let suggestionCount = parseInt(countSliderEl.value, 10) || 6;
+  let suggestionCount = parseInt(countSliderEl.value, 10) || 4;
   let detailWords = parseInt(detailSliderEl.value, 10) || 6;
   let latestTranscript = "";
 
   // Rolling pre-generated cache pushed continuously from the server
   let warmCache = {
-    phrases: Array.from({ length: 6 }, (_, i) => ({
-      text: "...",
-      confidence: i === 0 ? "high" : "medium",
-      score: Math.max(0.55, 0.92 - i * 0.05),
-    })),
-    provider: "ollama (llama3.2:3b)",
-    latency_ms: 0.0,
+    phrases: Array.from({ length: 4 }, () => ({ text: "..." })),
   };
 
   function connectWebSocket() {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+    const basePath = window.location.pathname.endsWith("/")
+      ? window.location.pathname
+      : `${window.location.pathname}/`;
+    ws = new WebSocket(`${protocol}//${window.location.host}${basePath}ws`);
     ws.binaryType = "arraybuffer";
 
     ws.onopen = () => {
@@ -97,56 +93,67 @@
     if (msg.type === "session_init") {
       if (msg.cache) {
         warmCache = msg.cache;
-        llmEngineBadge.textContent = `LLM: ${msg.cache.provider}`;
       }
-      sttEngineBadge.textContent = `STT: faster-whisper (${msg.whisper_model || "base.en"})`;
     } else if (msg.type === "transcript_update") {
       if (msg.last_snippet) {
         latestTranscript = msg.full_text || msg.last_snippet;
         contextSnippetEl.textContent = msg.last_snippet;
         contextSnippetEl.classList.remove("placeholder");
       }
-      if (msg.engine) {
-        sttEngineBadge.textContent = `STT: ${msg.engine}`;
-      }
     } else if (msg.type === "cache_update") {
+      // Silently update background cache without overwriting currently displayed suggestions
       if (msg.cache) {
         warmCache = msg.cache;
-        llmEngineBadge.textContent = `LLM: ${msg.cache.provider}`;
-        if (isShowingSuggestions) {
-          renderSuggestionsFromCache(0.0);
-        }
       }
     } else if (msg.type === "im_stuck_result") {
       if (msg.all_cached) {
         warmCache = msg.all_cached;
       }
-      if (isShowingSuggestions) {
-        renderSuggestionsList(
-          msg.suggestions,
-          msg.cache_retrieval_ms ?? 0.0,
-          warmCache.provider
-        );
+      renderSuggestionsList(msg.suggestions);
+    }
+  }
+
+  // Sync all UI states (blur overlay, pause button, primary button label)
+  function updateUIState() {
+    if (isListening) {
+      listeningPill.classList.remove("off");
+      listeningPill.classList.add("on");
+      listeningLabel.textContent = "Listening";
+    } else {
+      listeningPill.classList.remove("on");
+      listeningPill.classList.add("off");
+      listeningLabel.textContent = "Mic Off";
+    }
+
+    if (!isListening && !hasStartedMic) {
+      blurTarget.classList.add("blurred");
+      micOverlay.classList.remove("hidden");
+    } else {
+      blurTarget.classList.remove("blurred");
+      micOverlay.classList.add("hidden");
+    }
+
+    if (isListening) {
+      btnPauseMic.classList.remove("hidden");
+      btnPrimaryAction.classList.remove("turn-mic-on");
+      primaryActionText.textContent = "I'm Stuck";
+    } else {
+      btnPauseMic.classList.add("hidden");
+      if (hasStartedMic) {
+        btnPrimaryAction.classList.add("turn-mic-on");
+        primaryActionText.textContent = "Turn Mic On";
+      } else {
+        btnPrimaryAction.classList.remove("turn-mic-on");
+        primaryActionText.textContent = "I'm Stuck";
       }
     }
   }
 
-  // Toggle between showing suggestions and hiding them
-  function toggleSuggestions() {
-    if (isShowingSuggestions) {
-      hideSuggestions();
-    } else {
-      showSuggestions();
-    }
-  }
-
-  function showSuggestions() {
-    isShowingSuggestions = true;
-    stuckText.textContent = "Hide Suggestions";
-    btnStuck.classList.add("active");
-
-    const t0 = performance.now();
-    renderSuggestionsFromCache(performance.now() - t0);
+  // Show the latest set of suggestions from cache and log to backend
+  function showLatestSuggestions() {
+    if (!isListening) return;
+    renderSuggestionsList((warmCache.phrases || []).slice(0, suggestionCount));
+    updateUIState();
 
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(
@@ -160,56 +167,28 @@
     }
   }
 
-  function hideSuggestions() {
-    isShowingSuggestions = false;
-    stuckText.textContent = "I'm Stuck";
-    btnStuck.classList.remove("active");
-    suggestionsGrid.classList.add("hidden");
-    calmIdleBox.classList.remove("hidden");
-    suggestionModeTitle.textContent = "SUGGESTIONS";
-  }
-
-  function renderSuggestionsFromCache(retrievalMs) {
-    const items = (warmCache.phrases || []).slice(0, suggestionCount);
-    renderSuggestionsList(items, retrievalMs, warmCache.provider);
-  }
-
-  function renderSuggestionsList(items, retrievalMs, provider) {
+  function renderSuggestionsList(items) {
     if (!items || items.length === 0) return;
 
     calmIdleBox.classList.add("hidden");
-    suggestionsGrid.classList.remove("hidden");
+    suggestionsList.classList.remove("hidden");
+    suggestionsList.innerHTML = "";
 
-    suggestionModeTitle.textContent = "PHRASE COMPLETION SUGGESTIONS";
+    const visibleItems = items.slice(0, suggestionCount);
 
-    if (provider) {
-      llmEngineBadge.textContent = `LLM: ${provider}`;
-    }
-
-    suggestionsGrid.innerHTML = "";
-    items.slice(0, suggestionCount).forEach((item, idx) => {
-      const isHigh = item.confidence === "high" || idx === 0;
-      const pct = Math.round((item.score || Math.max(0.55, 0.9 - idx * 0.05)) * 100);
-
-      const card = document.createElement("div");
-      card.className = `suggestion-card ${isHigh ? "high-confidence" : "medium-confidence"}`;
-      card.innerHTML = `
-        <div class="card-top">
-          <span class="option-number">Option ${idx + 1}</span>
-          <span class="confidence-badge ${isHigh ? "high" : "medium"}">
-            ${isHigh ? `High Confidence (${pct}%)` : `Alternative (${pct}%)`}
-          </span>
-        </div>
-        <div class="suggestion-text"></div>
-      `;
+    visibleItems.forEach((item, idx) => {
       const trimmedWords = (item.text || "").split(/\s+/).slice(0, detailWords).join(" ");
-      card.querySelector(".suggestion-text").textContent = trimmedWords;
-      suggestionsGrid.appendChild(card);
+      const bubble = document.createElement("div");
+      bubble.className = idx === 0 ? "suggestion-bubble-primary" : "suggestion-bubble-alt";
+      bubble.style.animationDelay = `${idx * 25}ms`;
+      bubble.textContent = trimmedWords;
+      suggestionsList.appendChild(bubble);
     });
   }
 
   // Audio Capture: 16kHz PCM AudioWorklet -> Faster-Whisper
   async function startListening() {
+    if (isListening) return;
     try {
       mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -221,7 +200,7 @@
       });
 
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      await audioCtx.audioWorklet.addModule("/static/audio-processor.js");
+      await audioCtx.audioWorklet.addModule("static/audio-processor.js");
 
       const source = audioCtx.createMediaStreamSource(mediaStream);
       workletNode = new AudioWorkletNode(audioCtx, "pcm16-downsampler");
@@ -234,7 +213,8 @@
 
       source.connect(workletNode);
       isListening = true;
-      updateListeningUI();
+      hasStartedMic = true;
+      updateUIState();
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "listening_toggled", listening: true }));
       }
@@ -245,6 +225,7 @@
   }
 
   function stopListening() {
+    if (!isListening) return;
     isListening = false;
     if (workletNode) {
       workletNode.disconnect();
@@ -258,29 +239,17 @@
       mediaStream.getTracks().forEach((t) => t.stop());
       mediaStream = null;
     }
-    updateListeningUI();
+    updateUIState();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "listening_toggled", listening: false }));
     }
   }
 
-  function updateListeningUI() {
+  function toggleListening() {
     if (isListening) {
-      listeningPill.classList.remove("off");
-      listeningPill.classList.add("on");
-      listeningLabel.textContent = "Listening";
-      btnToggleListen.classList.remove("off");
-      btnToggleListen.classList.add("on");
-      btnToggleListen.setAttribute("aria-pressed", "true");
-      toggleText.textContent = "Listening: ON";
+      stopListening();
     } else {
-      listeningPill.classList.remove("on");
-      listeningPill.classList.add("off");
-      listeningLabel.textContent = "Mic Off (Paused)";
-      btnToggleListen.classList.remove("on");
-      btnToggleListen.classList.add("off");
-      btnToggleListen.setAttribute("aria-pressed", "false");
-      toggleText.textContent = "Listening: OFF";
+      startListening();
     }
   }
 
@@ -294,14 +263,47 @@
         })
       );
     }
-    if (isShowingSuggestions) {
-      showSuggestions();
+  }
+
+  function closeSettingsMenu() {
+    if (!settingsMenu.classList.contains("collapsed")) {
+      settingsMenu.classList.add("collapsed");
+      btnSettings.classList.remove("open");
+      btnSettings.setAttribute("aria-expanded", "false");
     }
   }
 
-  // Sliders inside Settings Menu
+  // Settings Sliders & Collapsible Menu
+  btnSettings.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const isCollapsed = settingsMenu.classList.toggle("collapsed");
+    btnSettings.classList.toggle("open", !isCollapsed);
+    btnSettings.setAttribute("aria-expanded", String(!isCollapsed));
+  });
+
+  // Auto-collapse settings menu whenever any other element on the site is clicked/pressed
+  document.addEventListener("pointerdown", (e) => {
+    if (
+      !settingsMenu.classList.contains("collapsed") &&
+      !settingsMenu.contains(e.target) &&
+      !btnSettings.contains(e.target)
+    ) {
+      closeSettingsMenu();
+    }
+  });
+
+  // Keep both language dropdowns in sync (placeholder for future translation support)
+  if (overlayLangSelect && settingsLangSelect) {
+    overlayLangSelect.addEventListener("change", () => {
+      settingsLangSelect.value = overlayLangSelect.value;
+    });
+    settingsLangSelect.addEventListener("change", () => {
+      overlayLangSelect.value = settingsLangSelect.value;
+    });
+  }
+
   countSliderEl.addEventListener("input", () => {
-    suggestionCount = parseInt(countSliderEl.value, 10) || 6;
+    suggestionCount = parseInt(countSliderEl.value, 10) || 4;
     countValEl.textContent = String(suggestionCount);
     pushSettingsUpdate();
   });
@@ -312,30 +314,36 @@
     pushSettingsUpdate();
   });
 
-  // Settings menu toggle
-  btnSettings.addEventListener("click", () => {
-    settingsMenu.classList.toggle("hidden");
-    btnSettings.classList.toggle("open");
-  });
+  // Button Listeners
+  listeningPill.addEventListener("click", () => toggleListening());
+  btnOverlayMic.addEventListener("click", () => startListening());
+  btnPauseMic.addEventListener("click", () => stopListening());
 
-  btnToggleListen.addEventListener("click", () => {
-    if (isListening) {
-      stopListening();
-    } else {
+  btnPrimaryAction.addEventListener("click", () => {
+    if (!isListening) {
       startListening();
+    } else {
+      showLatestSuggestions();
     }
   });
 
-  btnStuck.addEventListener("click", () => toggleSuggestions());
-
-  // Spacebar toggles suggestions on/off
+  // Spacebar shows latest suggestions when listening
   window.addEventListener("keydown", (e) => {
-    if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+    if (
+      e.target.tagName === "INPUT" ||
+      e.target.tagName === "TEXTAREA" ||
+      e.target.tagName === "SELECT"
+    ) {
+      return;
+    }
     if (e.code === "Space" || e.key === " ") {
       e.preventDefault();
-      toggleSuggestions();
+      if (isListening) {
+        showLatestSuggestions();
+      }
     }
   });
 
+  updateUIState();
   connectWebSocket();
 })();

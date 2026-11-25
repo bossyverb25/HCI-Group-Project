@@ -143,7 +143,7 @@ class SuggestionEngine:
         return self._clean_phrase(first_clause, max_words)
 
     async def generate(
-        self, transcript_context: str, count: int = 6, detail_words: int = 6
+        self, transcript_context: str, count: int = 4, detail_words: int = 6
     ) -> SuggestionBundle:
         """
         Generate `count` (1..10) phrase suggestions of up to `detail_words` (1..12) words each,

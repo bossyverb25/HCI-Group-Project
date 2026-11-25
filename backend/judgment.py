@@ -110,7 +110,7 @@ class JudgmentCacheManager:
         self.suggestion_engine = suggestion_engine
         self.hci_logger = hci_logger
         self.on_cache_ready = on_cache_ready
-        self.suggestion_count: int = 6
+        self.suggestion_count: int = 4
         self.detail_words: int = 6
 
         self._rolling_cache: deque[SuggestionBundle] = deque(maxlen=30)

@@ -2,115 +2,148 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>The Invisible Interpreter — Prototype v1</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Invisible Interpreter</title>
+  <link rel="stylesheet" href="static/style.css?v=10" />
 </head>
 <body>
   <div class="app-shell">
-    <!-- Top Bar: Status & Privacy Indicator -->
+    <!-- Top Bar: Thin Header & Clickable Mic Status Pill -->
     <header class="top-bar">
       <div class="brand">
-        <span class="brand-title">The Invisible Interpreter</span>
+        <span class="brand-title">Invisible Interpreter</span>
       </div>
 
       <div class="status-cluster">
         <div id="connection-badge" class="cache-badge">
           <span id="connection-state">Disconnected</span>
         </div>
-        <div id="listening-pill" class="listening-pill off" role="status" aria-live="polite">
+        <button id="listening-pill" class="listening-pill off" type="button" aria-live="polite" title="Click to toggle microphone">
           <span id="red-dot" class="status-dot"></span>
-          <span id="listening-label">Mic Off (Paused)</span>
-        </div>
+          <span id="listening-label">Mic Off</span>
+        </button>
       </div>
     </header>
 
-    <!-- Main Stage -->
-    <main class="stage">
-      <!-- System 1: Last few words / current incomplete phrase -->
-      <section class="context-card" aria-label="Live spoken context">
-        <div class="section-header">
-          <span class="section-tag">LIVE CONTEXT (LAST FEW WORDS)</span>
-          <span id="stt-engine-badge" class="engine-badge">STT: faster-whisper (base.en)</span>
-        </div>
+    <!-- Everything below the title bar (blurred on initial load until mic is turned on) -->
+    <div class="workspace-container">
+      <div id="blur-target" class="workspace-content blurred">
+        <!-- Main Stage -->
+        <main class="stage">
+          <!-- Live Context -->
+          <section class="context-card" aria-label="Live spoken context">
+            <span class="section-tag">LIVE CONTEXT</span>
+            <p id="context-snippet" class="context-text placeholder">
+              Listening for conversation...
+            </p>
+          </section>
 
-        <p id="context-snippet" class="context-text placeholder">
-          Press "Listening: ON" below and start speaking...
-        </p>
-      </section>
+          <!-- Suggestions Area -->
+          <section class="suggestions-stage" aria-live="assertive">
+            <!-- Idle state when user hasn't asked for help yet -->
+            <div id="calm-idle-box" class="calm-idle-box">
+              <p class="calm-desc">
+                Press <strong>I'm Stuck</strong> whenever you need a hint. <span class="desktop-only">(Spacebar)</span>
+              </p>
+            </div>
 
-      <!-- System 3: Center Stage — Dynamic (1-10) Phrase Suggestions -->
-      <section class="suggestions-stage" aria-live="assertive">
-        <div class="suggestions-header">
-          <span id="suggestion-mode-title" class="section-tag">
-            SUGGESTIONS
-          </span>
-          <div class="meta-pills">
-            <span id="llm-engine-badge" class="engine-badge">LLM: ollama (llama3.2:3b)</span>
+            <!-- Vertical Suggestions Stack: Slightly bigger first bubble + vertical alternatives -->
+            <div id="suggestions-list" class="suggestions-list hidden"></div>
+          </section>
+        </main>
+
+        <!-- Bottom Controls: Pause Mic -> Collapsible Sliders -> Settings Bar -> I'm Stuck -->
+        <footer class="bottom-controls">
+          <!-- Pause Microphone Button (above Settings, with microphone SVG) -->
+          <button id="btn-pause-mic" class="pause-mic-btn hidden" type="button">
+            <svg class="mic-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <line x1="12" x2="12" y1="19" y2="22"/>
+            </svg>
+            <span>Pause microphone</span>
+          </button>
+
+          <!-- Collapsible Settings Menu with Sliders & Language (collapsed by default) -->
+          <section id="settings-menu" class="settings-menu collapsed" aria-label="Suggestion settings">
+            <div class="slider-row">
+              <label for="suggestion-count-slider" class="slider-label">
+                Suggestions: <strong id="suggestion-count-value">4</strong>
+              </label>
+              <input
+                type="range"
+                id="suggestion-count-slider"
+                class="suggestion-slider"
+                min="1"
+                max="10"
+                value="4"
+              />
+            </div>
+
+            <div class="slider-row">
+              <label for="detail-slider" class="slider-label">
+                Detail: <strong id="detail-value">6</strong> words
+              </label>
+              <input
+                type="range"
+                id="detail-slider"
+                class="suggestion-slider"
+                min="1"
+                max="12"
+                value="6"
+              />
+            </div>
+
+            <div class="slider-row">
+              <label for="settings-language-select" class="slider-label">
+                Language:
+              </label>
+              <select id="settings-language-select" class="language-select" aria-label="Language">
+                <option value="english" selected>English</option>
+                <option value="german">German</option>
+                <option value="spanish">Spanish</option>
+                <option value="czech">Czech</option>
+                <option value="filipino">Filipino</option>
+              </select>
+            </div>
+          </section>
+
+          <!-- Single Long Bar Settings Button -->
+          <button id="btn-settings" class="settings-bar-btn" type="button" aria-expanded="false">
+            <span>Settings</span>
+            <span id="settings-chevron" class="settings-chevron" aria-hidden="true">⌄</span>
+          </button>
+
+          <!-- Primary Action Button: I'm Stuck (or Turn Mic On when paused after suggestions) -->
+          <button id="btn-primary-action" class="primary-action-btn" type="button">
+            <span id="primary-action-text">I'm Stuck</span>
+          </button>
+        </footer>
+      </div>
+
+      <!-- Initial Blur Overlay: Language Selector + Big Turn On Microphone Button -->
+      <div id="mic-overlay" class="mic-overlay">
+        <div class="overlay-stack">
+          <div class="overlay-lang-wrap">
+            <span class="overlay-lang-label">Language</span>
+            <select id="overlay-language-select" class="overlay-language-select" aria-label="Select language">
+              <option value="english" selected>English</option>
+              <option value="german">German</option>
+              <option value="spanish">Spanish</option>
+              <option value="czech">Czech</option>
+              <option value="filipino">Filipino</option>
+            </select>
           </div>
+
+          <button id="btn-overlay-mic" class="overlay-mic-btn" type="button">
+            <span class="overlay-mic-icon" aria-hidden="true">🎙️</span>
+            <span>Turn On Microphone</span>
+          </button>
         </div>
-
-        <!-- Idle state when user hasn't asked for help -->
-        <div id="calm-idle-box" class="calm-idle-box">
-          <p class="calm-desc">
-            Press <strong>I'm Stuck</strong> whenever you need a hint. (Spacebar)
-          </p>
-        </div>
-
-        <!-- Dynamic Suggestion Cards Grid (non-clickable display cards) -->
-        <div id="suggestions-grid" class="suggestions-grid hidden"></div>
-      </section>
-    </main>
-
-    <!-- Collapsible Settings Menu above the buttons (Hidden by default) -->
-    <section id="settings-menu" class="settings-menu hidden" aria-label="Suggestion settings">
-      <div class="slider-row">
-        <label for="suggestion-count-slider" class="slider-label">
-          Suggestions: <strong id="suggestion-count-value">6</strong>
-        </label>
-        <input
-          type="range"
-          id="suggestion-count-slider"
-          class="suggestion-slider"
-          min="1"
-          max="10"
-          value="6"
-        />
       </div>
-
-      <div class="slider-row">
-        <label for="detail-slider" class="slider-label">
-          Detail: <strong id="detail-value">6</strong> words
-        </label>
-        <input
-          type="range"
-          id="detail-slider"
-          class="suggestion-slider"
-          min="1"
-          max="12"
-          value="6"
-        />
-      </div>
-    </section>
-
-    <!-- Bottom Control Bar: Listening Toggle + I'm Stuck Button + Settings Icon Button -->
-    <footer class="control-bar">
-      <button id="btn-toggle-listen" class="ctrl-btn toggle-btn off" aria-pressed="false">
-        <span class="btn-icon" id="toggle-icon">🎙️</span>
-        <span class="btn-main" id="toggle-text">Listening: OFF</span>
-      </button>
-
-      <button id="btn-stuck" class="ctrl-btn stuck-btn phrases-btn">
-        <span class="btn-icon" id="stuck-icon">💬</span>
-        <span class="btn-main" id="stuck-text">I'm Stuck</span>
-      </button>
-
-      <button id="btn-settings" class="ctrl-btn settings-btn" aria-label="Settings" title="Settings">
-        <span class="btn-icon">⚙️</span>
-      </button>
-    </footer>
+    </div>
   </div>
 
-  <script src="/static/app.js"></script>
+  <script src="static/app.js?v=8"></script>
 </body>
 </html>
